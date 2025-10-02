@@ -12,6 +12,7 @@ from pyrogram.errors import AuthBytesInvalid
 from pyrogram.errors import BadRequest
 from pyrogram.errors import FileMigrate
 from pyrogram.errors import FloodWait
+from pyrogram.errors import GroupcallForbidden
 from pyrogram.raw.base import InputPeer
 from pyrogram.raw.base import InputUser
 from pyrogram.raw.functions.auth import ExportAuthorization
@@ -50,6 +51,7 @@ from pyrogram.raw.types import InputPhoneCall
 from pyrogram.raw.types import MessageActionChatDeleteUser
 from pyrogram.raw.types import MessageActionInviteToGroupCall
 from pyrogram.raw.types import MessageService
+from pyrogram.raw.types import PeerChannel
 from pyrogram.raw.types import PeerChat
 from pyrogram.raw.types import PhoneCall
 from pyrogram.raw.types import PhoneCallAccepted
@@ -61,6 +63,7 @@ from pyrogram.raw.types import PhoneCallProtocol
 from pyrogram.raw.types import PhoneCallRequested
 from pyrogram.raw.types import PhoneCallWaiting
 from pyrogram.raw.types import UpdateChannel
+from pyrogram.raw.types import UpdateChat
 from pyrogram.raw.types import UpdateGroupCall
 from pyrogram.raw.types import UpdateGroupCallConnection
 from pyrogram.raw.types import UpdateGroupCallParticipants
@@ -233,13 +236,21 @@ class PyrogramClient(BridgedClient):
                     )
             if isinstance(
                 update,
-                UpdateChannel,
+                (
+                    UpdateChannel,
+                    UpdateChat,
+                ),
             ):
                 chat_id = self.chat_id(update)
                 if len(chats) > 0:
                     if isinstance(
-                        chats[update.channel_id],
-                        ChannelForbidden,
+                        chats[
+                            self.chat_id(
+                                update,
+                                False,
+                            )
+                        ],
+                        (ChannelForbidden, ChatForbidden),
                     ):
                         self._cache.drop_cache(chat_id)
                         await self._propagate(
@@ -261,28 +272,36 @@ class PyrogramClient(BridgedClient):
                         update.message.action,
                         MessageActionInviteToGroupCall,
                     ):
-                        if isinstance(
-                            update.message.peer_id,
-                            PeerChat,
-                        ):
-                            await self._propagate(
-                                ChatUpdate(
-                                    chat_id,
-                                    ChatUpdate.Status.INVITED_VOICE_CHAT,
-                                    update.message.action,
-                                ),
-                            )
+                        await self._propagate(
+                            ChatUpdate(
+                                chat_id,
+                                ChatUpdate.Status.INVITED_VOICE_CHAT,
+                                update.message.action,
+                            ),
+                        )
+
                     if isinstance(
                         update.message.action,
                         MessageActionChatDeleteUser,
                     ):
                         if isinstance(
                             update.message.peer_id,
-                            PeerChat,
+                            (
+                                PeerChat,
+                                PeerChannel,
+                            ),
                         ):
                             if isinstance(
-                                chats[update.message.peer_id.chat_id],
-                                ChatForbidden,
+                                chats[
+                                    self.chat_id(
+                                        update.message.peer_id,
+                                        False,
+                                    )
+                                ],
+                                (
+                                    ChatForbidden,
+                                    ChannelForbidden,
+                                ),
                             ):
                                 self._cache.drop_cache(chat_id)
                                 await self._propagate(
@@ -415,33 +434,43 @@ class PyrogramClient(BridgedClient):
         video_stopped: bool,
         join_as: InputPeer,
     ) -> str:
-        chat_call = await self._cache.get_full_chat(chat_id)
-        if chat_call is not None:
-            result: Updates = await self._invoke(
-                JoinGroupCall(
-                    call=chat_call,
-                    params=DataJSON(data=json_join),
-                    muted=False,
-                    join_as=join_as,
-                    video_stopped=video_stopped,
-                    invite_hash=invite_hash,
-                ),
+        try:
+            chat_call = await self._cache.get_full_chat(chat_id)
+            if chat_call is not None:
+                result: Updates = await self._invoke(
+                    JoinGroupCall(
+                        call=chat_call,
+                        params=DataJSON(data=json_join),
+                        muted=False,
+                        join_as=join_as,
+                        video_stopped=video_stopped,
+                        invite_hash=invite_hash,
+                    ),
+                )
+                for update in result.updates:
+                    if isinstance(
+                        update,
+                        UpdateGroupCallParticipants,
+                    ):
+                        participants = update.participants
+                        for participant in participants:
+                            self._cache.set_participants_cache(
+                                chat_id,
+                                update.call.id,
+                                self.parse_participant_action(participant),
+                                self.parse_participant(participant),
+                            )
+                    if isinstance(update, UpdateGroupCallConnection):
+                        return update.params.data
+        except GroupcallForbidden:
+            self._cache.drop_cache(chat_id)
+            return await self.join_group_call(
+                chat_id,
+                json_join,
+                invite_hash,
+                video_stopped,
+                join_as,
             )
-            for update in result.updates:
-                if isinstance(
-                    update,
-                    UpdateGroupCallParticipants,
-                ):
-                    participants = update.participants
-                    for participant in participants:
-                        self._cache.set_participants_cache(
-                            chat_id,
-                            update.call.id,
-                            self.parse_participant_action(participant),
-                            self.parse_participant(participant),
-                        )
-                if isinstance(update, UpdateGroupCallConnection):
-                    return update.params.data
 
         return json.dumps({'transport': None})
 

@@ -10,6 +10,7 @@ from hydrogram.errors import AuthBytesInvalid
 from hydrogram.errors import BadRequest
 from hydrogram.errors import FileMigrate
 from hydrogram.errors import FloodWait
+from hydrogram.errors.exceptions import GroupcallForbidden
 from hydrogram.raw.base import InputPeer
 from hydrogram.raw.base import InputUser
 from hydrogram.raw.functions.auth import ExportAuthorization
@@ -59,6 +60,7 @@ from hydrogram.raw.types import PhoneCallProtocol
 from hydrogram.raw.types import PhoneCallRequested
 from hydrogram.raw.types import PhoneCallWaiting
 from hydrogram.raw.types import UpdateChannel
+from hydrogram.raw.types import UpdateChat
 from hydrogram.raw.types import UpdateGroupCall
 from hydrogram.raw.types import UpdateGroupCallConnection
 from hydrogram.raw.types import UpdateGroupCallParticipants
@@ -70,6 +72,7 @@ from hydrogram.raw.types import Updates
 from hydrogram.raw.types.messages import DhConfig
 from hydrogram.session import Auth
 from hydrogram.session import Session
+from hydrogram.types import PeerChannel
 from ntgcalls import MediaSegmentQuality
 from ntgcalls import Protocol
 
@@ -232,13 +235,21 @@ class HydrogramClient(BridgedClient):
                     )
             if isinstance(
                 update,
-                UpdateChannel,
+                (
+                    UpdateChannel,
+                    UpdateChat,
+                ),
             ):
                 chat_id = self.chat_id(update)
                 if len(chats) > 0:
                     if isinstance(
-                        chats[update.channel_id],
-                        ChannelForbidden,
+                        chats[
+                            self.chat_id(
+                                update,
+                                False,
+                            )
+                        ],
+                        (ChannelForbidden, ChatForbidden),
                     ):
                         self._cache.drop_cache(chat_id)
                         await self._propagate(
@@ -260,28 +271,36 @@ class HydrogramClient(BridgedClient):
                         update.message.action,
                         MessageActionInviteToGroupCall,
                     ):
-                        if isinstance(
-                            update.message.peer_id,
-                            PeerChat,
-                        ):
-                            await self._propagate(
-                                ChatUpdate(
-                                    chat_id,
-                                    ChatUpdate.Status.INVITED_VOICE_CHAT,
-                                    update.message.action,
-                                ),
-                            )
+                        await self._propagate(
+                            ChatUpdate(
+                                chat_id,
+                                ChatUpdate.Status.INVITED_VOICE_CHAT,
+                                update.message.action,
+                            ),
+                        )
+
                     if isinstance(
                         update.message.action,
                         MessageActionChatDeleteUser,
                     ):
                         if isinstance(
                             update.message.peer_id,
-                            PeerChat,
+                            (
+                                PeerChat,
+                                PeerChannel,
+                            ),
                         ):
                             if isinstance(
-                                chats[update.message.peer_id.chat_id],
-                                ChatForbidden,
+                                chats[
+                                    self.chat_id(
+                                        update.message.peer_id,
+                                        False,
+                                    )
+                                ],
+                                (
+                                    ChatForbidden,
+                                    ChannelForbidden,
+                                ),
                             ):
                                 self._cache.drop_cache(chat_id)
                                 await self._propagate(
@@ -414,33 +433,43 @@ class HydrogramClient(BridgedClient):
         video_stopped: bool,
         join_as: InputPeer,
     ) -> str:
-        chat_call = await self._cache.get_full_chat(chat_id)
-        if chat_call is not None:
-            result: Updates = await self._invoke(
-                JoinGroupCall(
-                    call=chat_call,
-                    params=DataJSON(data=json_join),
-                    muted=False,
-                    join_as=join_as,
-                    video_stopped=video_stopped,
-                    invite_hash=invite_hash,
-                ),
+        try:
+            chat_call = await self._cache.get_full_chat(chat_id)
+            if chat_call is not None:
+                result: Updates = await self._invoke(
+                    JoinGroupCall(
+                        call=chat_call,
+                        params=DataJSON(data=json_join),
+                        muted=False,
+                        join_as=join_as,
+                        video_stopped=video_stopped,
+                        invite_hash=invite_hash,
+                    ),
+                )
+                for update in result.updates:
+                    if isinstance(
+                        update,
+                        UpdateGroupCallParticipants,
+                    ):
+                        participants = update.participants
+                        for participant in participants:
+                            self._cache.set_participants_cache(
+                                chat_id,
+                                update.call.id,
+                                self.parse_participant_action(participant),
+                                self.parse_participant(participant),
+                            )
+                    if isinstance(update, UpdateGroupCallConnection):
+                        return update.params.data
+        except GroupcallForbidden:
+            self._cache.drop_cache(chat_id)
+            return await self.join_group_call(
+                chat_id,
+                json_join,
+                invite_hash,
+                video_stopped,
+                join_as,
             )
-            for update in result.updates:
-                if isinstance(
-                    update,
-                    UpdateGroupCallParticipants,
-                ):
-                    participants = update.participants
-                    for participant in participants:
-                        self._cache.set_participants_cache(
-                            chat_id,
-                            update.call.id,
-                            self.parse_participant_action(participant),
-                            self.parse_participant(participant),
-                        )
-                if isinstance(update, UpdateGroupCallConnection):
-                    return update.params.data
 
         return json.dumps({'transport': None})
 

@@ -8,8 +8,10 @@ from ntgcalls import Protocol
 from telethon import TelegramClient
 from telethon.errors import BadRequestError
 from telethon.errors import ChannelPrivateError
+from telethon.errors import ChatForbiddenError
 from telethon.errors import FileMigrateError
 from telethon.errors import FloodWaitError
+from telethon.errors import GroupcallForbiddenError
 from telethon.events import Raw
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import GetDhConfigRequest
@@ -30,6 +32,7 @@ from telethon.tl.functions.phone import LeaveGroupCallRequest
 from telethon.tl.functions.phone import RequestCallRequest
 from telethon.tl.functions.phone import SendSignalingDataRequest
 from telethon.tl.functions.upload import GetFileRequest
+from telethon.tl.types import ChannelForbidden
 from telethon.tl.types import ChatForbidden
 from telethon.tl.types import DataJSON
 from telethon.tl.types import GroupCall
@@ -57,6 +60,7 @@ from telethon.tl.types import TypeInputChannel
 from telethon.tl.types import TypeInputPeer
 from telethon.tl.types import TypeInputUser
 from telethon.tl.types import UpdateChannel
+from telethon.tl.types import UpdateChat
 from telethon.tl.types import UpdateGroupCall
 from telethon.tl.types import UpdateGroupCallConnection
 from telethon.tl.types import UpdateGroupCallParticipants
@@ -232,14 +236,19 @@ class TelethonClient(BridgedClient):
                     )
             if isinstance(
                 update,
-                UpdateChannel,
+                (
+                    UpdateChannel,
+                    UpdateChat,
+                ),
             ):
                 chat_id = self.chat_id(update)
                 try:
                     await self._app.get_entity(
-                        PeerChannel(chat_id),
+                        PeerChannel(chat_id)
+                        if isinstance(update, UpdateChannel)
+                        else PeerChat(chat_id),
                     )
-                except ChannelPrivateError:
+                except (ChannelPrivateError, ChatForbiddenError):
                     self._cache.drop_cache(chat_id)
                     await self._propagate(
                         ChatUpdate(
@@ -268,26 +277,32 @@ class TelethonClient(BridgedClient):
                                 update.message.action,
                             ),
                         )
-                    if isinstance(update.message.out, bool):
-                        if update.message.out:
-                            self._cache.drop_cache(chat_id)
-                            await self._propagate(
-                                ChatUpdate(
-                                    chat_id,
-                                    ChatUpdate.Status.LEFT_GROUP,
-                                ),
-                            )
                     if isinstance(
                         update.message.action,
                         MessageActionChatDeleteUser,
                     ):
+                        if isinstance(update.message.out, bool):
+                            if update.message.out:
+                                self._cache.drop_cache(chat_id)
+                                await self._propagate(
+                                    ChatUpdate(
+                                        chat_id,
+                                        ChatUpdate.Status.LEFT_GROUP,
+                                    ),
+                                )
                         if isinstance(
                             update.message.peer_id,
-                            PeerChat,
+                            (
+                                PeerChat,
+                                PeerChannel,
+                            ),
                         ):
                             if isinstance(
                                 await self._app.get_entity(chat_id),
-                                ChatForbidden,
+                                (
+                                    ChatForbidden,
+                                    ChannelForbidden,
+                                ),
                             ):
                                 self._cache.drop_cache(chat_id)
                                 await self._propagate(
@@ -401,33 +416,43 @@ class TelethonClient(BridgedClient):
         video_stopped: bool,
         join_as: TypeInputPeer,
     ) -> str:
-        chat_call = await self._cache.get_full_chat(chat_id)
-        if chat_call is not None:
-            result: Updates = await self._invoke(
-                JoinGroupCallRequest(
-                    call=chat_call,
-                    params=DataJSON(data=json_join),
-                    muted=False,
-                    join_as=join_as,
-                    video_stopped=video_stopped,
-                    invite_hash=invite_hash,
-                ),
+        try:
+            chat_call = await self._cache.get_full_chat(chat_id)
+            if chat_call is not None:
+                result: Updates = await self._invoke(
+                    JoinGroupCallRequest(
+                        call=chat_call,
+                        params=DataJSON(data=json_join),
+                        muted=False,
+                        join_as=join_as,
+                        video_stopped=video_stopped,
+                        invite_hash=invite_hash,
+                    ),
+                )
+                for update in result.updates:
+                    if isinstance(
+                        update,
+                        UpdateGroupCallParticipants,
+                    ):
+                        participants = update.participants
+                        for participant in participants:
+                            self._cache.set_participants_cache(
+                                chat_id,
+                                update.call.id,
+                                self.parse_participant_action(participant),
+                                self.parse_participant(participant),
+                            )
+                    if isinstance(update, UpdateGroupCallConnection):
+                        return update.params.data
+        except GroupcallForbiddenError:
+            self._cache.drop_cache(chat_id)
+            return await self.join_group_call(
+                chat_id,
+                json_join,
+                invite_hash,
+                video_stopped,
+                join_as,
             )
-            for update in result.updates:
-                if isinstance(
-                    update,
-                    UpdateGroupCallParticipants,
-                ):
-                    participants = update.participants
-                    for participant in participants:
-                        self._cache.set_participants_cache(
-                            chat_id,
-                            update.call.id,
-                            self.parse_participant_action(participant),
-                            self.parse_participant(participant),
-                        )
-                if isinstance(update, UpdateGroupCallConnection):
-                    return update.params.data
 
         return json.dumps({'transport': None})
 
